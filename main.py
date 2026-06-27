@@ -213,7 +213,12 @@ async def _send(phone: str, message: str, file_items: list[dict]) -> dict:
             size_bytes = item.get("size_bytes", file_path.stat().st_size)
 
             attachment_send_button = page.locator(
-                "div[role='button'][aria-label='Send'], button[aria-label='Send']"
+                "div[role='button'][aria-label='Send'], "
+                "button[aria-label='Send'], "
+                "div[role='button'][aria-label='שלח'], "
+                "button[aria-label='שלח'], "
+                "span[data-icon='send'], "
+                "[data-testid='send']"
             ).last
 
             # Open attach menu and click Document to get a file chooser
@@ -240,14 +245,18 @@ async def _send(phone: str, message: str, file_items: list[dict]) -> dict:
                             continue
                 fc = await fc_info.value
                 await fc.set_files(str(file_path))
-                await page.wait_for_timeout(2000)
+                await page.wait_for_timeout(5000)
             except Exception as exc:
                 raise RuntimeError(
                     f"Could not attach {item['name']}: {exc}. "
                     "Check /qr/page to confirm session is active."
                 )
 
-            await attachment_send_button.wait_for(timeout=30000)
+            # Wait for attachment send button — try clicking, fall back to Enter
+            try:
+                await attachment_send_button.wait_for(timeout=20000)
+            except Exception:
+                pass  # fall through to Enter fallback
             await page.wait_for_timeout(max(2000, _file_send_wait_ms(size_bytes) - 3000))
 
             clicked = False
