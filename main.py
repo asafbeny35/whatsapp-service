@@ -376,6 +376,43 @@ async def qr_image():
         return JSONResponse({"error": str(exc), "trace": traceback.format_exc()}, status_code=500)
 
 
+@app.get("/debug/attach")
+async def debug_attach():
+    """Navigate to a chat, open the attach menu, and return a screenshot + all clickable elements."""
+    from fastapi.responses import Response
+    import base64 as _b64
+    try:
+        _, page = await _get_fresh_page()
+        await page.goto("https://web.whatsapp.com/send?phone=972547720142", wait_until="domcontentloaded", timeout=60000)
+        # Wait for chat UI
+        for _ in range(30):
+            await page.wait_for_timeout(1000)
+            attach = page.locator("button[aria-label='Attach'], span[data-icon='attach-menu-plus'], button[aria-label='קובץ מצורף']")
+            if await attach.count() > 0:
+                break
+        # Click attach button
+        await attach.first.click()
+        await page.wait_for_timeout(1500)
+        # Capture screenshot + DOM of menu
+        screenshot = await page.screenshot(full_page=False)
+        # Get all interactive elements visible on screen
+        elements = await page.evaluate("""() => {
+            const els = document.querySelectorAll('li, [role="menuitem"], [role="button"], button, [data-testid]');
+            return Array.from(els).slice(0, 60).map(el => ({
+                tag: el.tagName,
+                role: el.getAttribute('role'),
+                testid: el.getAttribute('data-testid'),
+                aria: el.getAttribute('aria-label'),
+                text: el.innerText?.slice(0, 50),
+                visible: el.offsetParent !== null
+            }));
+        }""")
+        return JSONResponse({"screenshot_b64": _b64.b64encode(screenshot).decode(), "elements": elements})
+    except Exception as exc:
+        import traceback
+        return JSONResponse({"error": str(exc), "trace": traceback.format_exc()}, status_code=500)
+
+
 @app.post("/send")
 async def send_endpoint(body: dict):
     if SECRET_TOKEN and body.get("secret") != SECRET_TOKEN:
