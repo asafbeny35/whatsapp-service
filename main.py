@@ -47,11 +47,17 @@ async def _warm_whatsapp():
             window.chrome = {runtime: {}};
         """)
         await page.goto("https://web.whatsapp.com", wait_until="domcontentloaded", timeout=60000)
-        # Wait until authenticated (chat list visible — NOT QR canvas alone)
-        for _ in range(60):
+        # Wait until authenticated — check for any persistent UI element that only appears after login
+        for _ in range(90):
             await page.wait_for_timeout(2000)
-            chat = page.locator("div[aria-label='Chat list'], div[data-icon='chat'], #side")
-            if await chat.count() > 0:
+            authenticated = page.locator(
+                "[data-testid='chatlist-header'], "
+                "[data-testid='drawer-left'], "
+                "header[data-testid='chatlist-header'], "
+                "div[aria-label='Chat list'], "
+                "#side, div[data-testid='chat-list']"
+            )
+            if await authenticated.count() > 0:
                 _WA_READY = True
                 logging.warning("WhatsApp Web warmed up and authenticated.")
                 return
@@ -210,54 +216,36 @@ async def _send(phone: str, message: str, file_items: list[dict]) -> dict:
                 "div[role='button'][aria-label='Send'], button[aria-label='Send']"
             ).last
 
-            # Open the attach menu first — activates file input listeners in WhatsApp Web
+            # Open attach menu and click Document to get a file chooser
             await attach_button.first.wait_for(timeout=30000)
-            await attach_button.first.click()
-            await page.wait_for_timeout(800)
-
-            # Strategy 1: set_input_files on the now-active hidden file input
-            injected = False
             try:
-                file_inputs = page.locator("input[type='file']")
-                count = await file_inputs.count()
-                for i in range(count):
-                    try:
-                        await file_inputs.nth(i).set_input_files(str(file_path), timeout=5000)
-                        await page.wait_for_timeout(2500)
-                        if await attachment_send_button.count() > 0:
-                            injected = True
-                            break
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-
-            if not injected:
-                # Strategy 2: click Document menu item to get a file chooser
-                fc = None
-                for selector in [
-                    "li[data-testid='mi-attach-document']",
-                    "li[data-testid='attach-document']",
-                    "[role='menuitem'][aria-label*='ocument']",
-                    "[role='menuitem'][aria-label*='מסמך']",
-                ]:
-                    try:
+                async with page.expect_file_chooser(timeout=20000) as fc_info:
+                    await attach_button.first.click()
+                    await page.wait_for_timeout(1000)
+                    # Click Document option — selector confirmed from live WhatsApp Web DOM
+                    for selector in [
+                        "button[role='menuitem'][aria-label='Document']",
+                        "button[role='menuitem'][aria-label='מסמך']",
+                        "[role='menuitem'][aria-label='Document']",
+                        "[role='menuitem'][aria-label='מסמך']",
+                        "li[data-testid='mi-attach-document']",
+                        "li[data-testid='attach-document']",
+                    ]:
                         loc = page.locator(selector)
-                        if await loc.count() > 0:
-                            async with page.expect_file_chooser(timeout=8000) as fc_info:
+                        try:
+                            if await loc.count() > 0:
                                 await loc.first.click(timeout=5000)
-                            fc = await fc_info.value
-                            break
-                    except Exception:
-                        continue
-
-                if fc is None:
-                    raise RuntimeError(
-                        f"Could not attach {item['name']} — WhatsApp Web UI may have changed. "
-                        "Check /qr/page to confirm session is active."
-                    )
+                                break
+                        except Exception:
+                            continue
+                fc = await fc_info.value
                 await fc.set_files(str(file_path))
                 await page.wait_for_timeout(2000)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Could not attach {item['name']}: {exc}. "
+                    "Check /qr/page to confirm session is active."
+                )
 
             await attachment_send_button.wait_for(timeout=30000)
             await page.wait_for_timeout(max(2000, _file_send_wait_ms(size_bytes) - 3000))
@@ -375,57 +363,6 @@ async def qr_image():
         import traceback
         return JSONResponse({"error": str(exc), "trace": traceback.format_exc()}, status_code=500)
 
-
-@app.get("/debug/attach")
-async def debug_attach():
-    """Navigate to a chat, open the attach menu, and return a screenshot + all clickable elements."""
-    from fastapi.responses import Response
-    import base64 as _b64
-    try:
-        _, page = await _get_fresh_page()
-        await page.goto("https://web.whatsapp.com/send?phone=972547720142", wait_until="domcontentloaded", timeout=60000)
-        # Wait for chat UI
-        for _ in range(30):
-            await page.wait_for_timeout(1000)
-            attach = page.locator("button[aria-label='Attach'], span[data-icon='attach-menu-plus'], button[aria-label='קובץ מצורף']")
-            if await attach.count() > 0:
-                break
-        # Click attach button
-        await attach.first.click()
-        await page.wait_for_timeout(1500)
-        # Capture screenshot + DOM of menu
-        screenshot = await page.screenshot(full_page=False)
-        # Find popup menu elements by text content
-        elements = await page.evaluate("""() => {
-            const keywords = ['Document','Photos','Camera','Audio','Contact','Poll','Sticker','Catalog','Quick','מסמך','תמונה','שמע'];
-            const results = [];
-            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
-            let node;
-            while (node = walker.nextNode()) {
-                const text = (node.innerText || node.textContent || '').trim().slice(0, 60);
-                const testid = node.getAttribute('data-testid') || '';
-                const aria = node.getAttribute('aria-label') || '';
-                if (keywords.some(k => text.includes(k) || testid.includes(k.toLowerCase()) || aria.includes(k))) {
-                    const rect = node.getBoundingClientRect();
-                    results.push({
-                        tag: node.tagName,
-                        role: node.getAttribute('role'),
-                        testid,
-                        aria,
-                        text: text.slice(0, 60),
-                        classes: node.className.slice(0, 80),
-                        visible: rect.width > 0 && rect.height > 0,
-                        x: Math.round(rect.x), y: Math.round(rect.y)
-                    });
-                }
-                if (results.length >= 40) break;
-            }
-            return results;
-        }""")
-        return JSONResponse({"screenshot_b64": _b64.b64encode(screenshot).decode(), "elements": elements})
-    except Exception as exc:
-        import traceback
-        return JSONResponse({"error": str(exc), "trace": traceback.format_exc()}, status_code=500)
 
 
 @app.post("/send")
