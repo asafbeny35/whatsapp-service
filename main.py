@@ -35,6 +35,30 @@ async def _startup():
     asyncio.create_task(_warm_whatsapp())
 
 
+@app.on_event("shutdown")
+async def _on_shutdown():
+    """Close Chromium gracefully so profile data is flushed to Railway volume."""
+    import logging
+    global _PAGE, _CONTEXT, _PLAYWRIGHT
+    logging.warning("Shutdown: closing Chromium context...")
+    if _PAGE and not _PAGE.is_closed():
+        try:
+            await _PAGE.close()
+        except Exception:
+            pass
+    if _CONTEXT:
+        try:
+            await _CONTEXT.close()
+        except Exception:
+            pass
+    if _PLAYWRIGHT:
+        try:
+            await _PLAYWRIGHT.stop()
+        except Exception:
+            pass
+    logging.warning("Shutdown: Chromium closed.")
+
+
 async def _warm_whatsapp():
     global _WA_READY
     try:
@@ -163,6 +187,16 @@ async def _send(phone: str, message: str, file_items: list[dict]) -> dict:
         send_url += f"&text={quote(message)}"
 
     await page.goto(send_url, wait_until="domcontentloaded", timeout=60000)
+
+    # Quick auth check — fail fast instead of hanging 330s in _chat_ready
+    await page.wait_for_timeout(4000)
+    _qr_count = await page.locator("canvas, div[data-ref]").count()
+    _chat_count = await page.locator("footer, #side, [data-testid='chatlist-header']").count()
+    if _qr_count and not _chat_count:
+        raise RuntimeError(
+            "WhatsApp Web is not authenticated. "
+            "Visit /qr/page to scan the QR code, then retry."
+        )
 
     attach_button = page.locator("button[aria-label='Attach']")
     message_box = page.locator(
