@@ -395,17 +395,32 @@ async def debug_attach():
         await page.wait_for_timeout(1500)
         # Capture screenshot + DOM of menu
         screenshot = await page.screenshot(full_page=False)
-        # Get all interactive elements visible on screen
+        # Find popup menu elements by text content
         elements = await page.evaluate("""() => {
-            const els = document.querySelectorAll('li, [role="menuitem"], [role="button"], button, [data-testid]');
-            return Array.from(els).slice(0, 60).map(el => ({
-                tag: el.tagName,
-                role: el.getAttribute('role'),
-                testid: el.getAttribute('data-testid'),
-                aria: el.getAttribute('aria-label'),
-                text: el.innerText?.slice(0, 50),
-                visible: el.offsetParent !== null
-            }));
+            const keywords = ['Document','Photos','Camera','Audio','Contact','Poll','Sticker','Catalog','Quick','מסמך','תמונה','שמע'];
+            const results = [];
+            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+            let node;
+            while (node = walker.nextNode()) {
+                const text = (node.innerText || node.textContent || '').trim().slice(0, 60);
+                const testid = node.getAttribute('data-testid') || '';
+                const aria = node.getAttribute('aria-label') || '';
+                if (keywords.some(k => text.includes(k) || testid.includes(k.toLowerCase()) || aria.includes(k))) {
+                    const rect = node.getBoundingClientRect();
+                    results.push({
+                        tag: node.tagName,
+                        role: node.getAttribute('role'),
+                        testid,
+                        aria,
+                        text: text.slice(0, 60),
+                        classes: node.className.slice(0, 80),
+                        visible: rect.width > 0 && rect.height > 0,
+                        x: Math.round(rect.x), y: Math.round(rect.y)
+                    });
+                }
+                if (results.length >= 40) break;
+            }
+            return results;
         }""")
         return JSONResponse({"screenshot_b64": _b64.b64encode(screenshot).decode(), "elements": elements})
     except Exception as exc:
