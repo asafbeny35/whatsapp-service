@@ -67,7 +67,9 @@ _AUTHENTICATED_SELECTOR = (
     "div[aria-label='Chat list'], "
     "#side, div[data-testid='chat-list']"
 )
-_QR_SELECTOR = "canvas, div[data-ref]"
+# רק עטיפת ה-QR של מסך ההתחברות — לא canvas גנרי: תצוגות PDF בצ'אטים
+# נרנדרות כ-canvas וגרמו ל-false negative (הסשן דווח כמנותק אחרי כל שליחה)
+_QR_SELECTOR = "div[data-ref]"
 
 
 async def _check_wa_authenticated(page) -> bool:
@@ -384,7 +386,7 @@ async def _get_whatsapp_screenshot() -> bytes:
     # Try to extract canvas pixel data via JS (works even when CSS rendering fails)
     try:
         canvas_data_url = await page.evaluate("""() => {
-            const canvas = document.querySelector('canvas');
+            const canvas = document.querySelector('div[data-ref] canvas') || document.querySelector('canvas');
             if (!canvas) return null;
             try { return canvas.toDataURL('image/png'); } catch(e) { return null; }
         }""")
