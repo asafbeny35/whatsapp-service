@@ -26,13 +26,14 @@ _CONTEXT = None
 _PAGE = None  # single persistent page — keeps WhatsApp Web in memory
 _CONTEXT_LOCK = asyncio.Lock()
 _BIDI_CHARS = {0x200F, 0x200E, 0x202B, 0x202A, 0x202C, 0x202D, 0x202E}
-_WA_READY = False  # True once WhatsApp Web is loaded
+_WA_READY = False  # True while WhatsApp Web is loaded AND authenticated
+_SEND_IN_PROGRESS = False  # monitor must not navigate while a send is running
 
 
 @app.on_event("startup")
 async def _startup():
-    """Pre-warm the browser and load WhatsApp Web on startup."""
-    asyncio.create_task(_warm_whatsapp())
+    """Pre-warm the browser and keep monitoring WhatsApp Web auth state."""
+    asyncio.create_task(_monitor_whatsapp())
 
 
 @app.on_event("shutdown")
@@ -59,36 +60,54 @@ async def _on_shutdown():
     logging.warning("Shutdown: Chromium closed.")
 
 
-async def _warm_whatsapp():
+_AUTHENTICATED_SELECTOR = (
+    "[data-testid='chatlist-header'], "
+    "[data-testid='drawer-left'], "
+    "header[data-testid='chatlist-header'], "
+    "div[aria-label='Chat list'], "
+    "#side, div[data-testid='chat-list']"
+)
+_QR_SELECTOR = "canvas, div[data-ref]"
+
+
+async def _check_wa_authenticated(page) -> bool:
+    """Authenticated = chat UI present AND no QR canvas on screen."""
+    authenticated = await page.locator(_AUTHENTICATED_SELECTOR).count()
+    qr = await page.locator(_QR_SELECTOR).count()
+    return authenticated > 0 and qr == 0
+
+
+async def _monitor_whatsapp():
+    """Keep _WA_READY accurate for the whole process lifetime.
+
+    The previous warm-up gave up after ~3 minutes, so a QR scanned later never
+    flipped the flag back to true and /health lied forever.
+    """
     global _WA_READY
-    try:
-        import logging
-        logging.warning("Warming up WhatsApp Web...")
-        _, page = await _get_fresh_page()
-        await page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
-            window.chrome = {runtime: {}};
-        """)
-        await page.goto("https://web.whatsapp.com", wait_until="domcontentloaded", timeout=60000)
-        # Wait until authenticated — check for any persistent UI element that only appears after login
-        for _ in range(90):
-            await page.wait_for_timeout(2000)
-            authenticated = page.locator(
-                "[data-testid='chatlist-header'], "
-                "[data-testid='drawer-left'], "
-                "header[data-testid='chatlist-header'], "
-                "div[aria-label='Chat list'], "
-                "#side, div[data-testid='chat-list']"
-            )
-            if await authenticated.count() > 0:
-                _WA_READY = True
-                logging.warning("WhatsApp Web warmed up and authenticated.")
-                return
-        logging.warning("WhatsApp Web warm-up: not authenticated (QR scan needed).")
-    except Exception as exc:
-        import logging
-        logging.error(f"WhatsApp warm-up failed: {exc}")
+    import logging
+    logging.warning("Starting WhatsApp Web monitor...")
+    while True:
+        if _SEND_IN_PROGRESS:
+            await asyncio.sleep(15)
+            continue
+        try:
+            _, page = await _get_fresh_page()
+            if "web.whatsapp.com" not in (page.url or ""):
+                await page.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                    Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
+                    window.chrome = {runtime: {}};
+                """)
+                await page.goto("https://web.whatsapp.com", wait_until="domcontentloaded", timeout=60000)
+                await page.wait_for_timeout(8000)
+            was_ready = _WA_READY
+            _WA_READY = await _check_wa_authenticated(page)
+            if _WA_READY != was_ready:
+                logging.warning(f"WhatsApp Web auth state changed: ready={_WA_READY}")
+        except Exception as exc:
+            _WA_READY = False
+            logging.error(f"WhatsApp monitor cycle failed: {exc}")
+        await asyncio.sleep(20 if not _WA_READY else 60)
 
 PROFILE_DIR = Path(os.environ.get("WHATSAPP_PROFILE_DIR", "/app/whatsapp-profile"))
 PROFILE_DIR.mkdir(parents=True, exist_ok=True)
@@ -176,6 +195,27 @@ async def _get_fresh_page():
         return _CONTEXT, _PAGE
 
 
+async def _wait_for_delivery(page, timeout_ms: int = 45000) -> None:
+    """Fail loudly when outgoing messages stay stuck on the pending clock.
+
+    A zombie session (chat UI cached but phone link dead) accepts sends into
+    the chat DOM but never delivers them — without this check that path
+    returned "ok" upstream and documents silently never arrived.
+    """
+    waited = 0
+    while True:
+        pending = await page.locator("span[data-icon='msg-time']").count()
+        if pending == 0:
+            return
+        if waited >= timeout_ms:
+            raise RuntimeError(
+                f"{pending} message(s) stuck in pending state — WhatsApp Web shows the chat "
+                "but is not delivering (session likely dead). Visit /qr/page to re-link, then retry."
+            )
+        await page.wait_for_timeout(3000)
+        waited += 3000
+
+
 async def _send(phone: str, message: str, file_items: list[dict]) -> dict:
     """file_items: list of {name, content_b64, size_bytes}"""
     phone = _normalize_phone(phone)
@@ -193,6 +233,8 @@ async def _send(phone: str, message: str, file_items: list[dict]) -> dict:
     _qr_count = await page.locator("canvas, div[data-ref]").count()
     _chat_count = await page.locator("footer, #side, [data-testid='chatlist-header']").count()
     if _qr_count and not _chat_count:
+        global _WA_READY
+        _WA_READY = False
         raise RuntimeError(
             "WhatsApp Web is not authenticated. "
             "Visit /qr/page to scan the QR code, then retry."
@@ -309,6 +351,8 @@ async def _send(phone: str, message: str, file_items: list[dict]) -> dict:
             await page.wait_for_timeout(_file_post_send_wait_ms(size_bytes))
 
     await page.wait_for_timeout(5000)
+    # Verify the messages actually left the device — a zombie session keeps them pending forever
+    await _wait_for_delivery(page)
     # Don't close the page — keep it alive so WhatsApp Web stays in memory
     return {"status": "ok", "phone": phone}
 
@@ -410,14 +454,19 @@ async def qr_image():
 
 @app.post("/send")
 async def send_endpoint(body: dict):
+    global _SEND_IN_PROGRESS, _WA_READY
     if SECRET_TOKEN and body.get("secret") != SECRET_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
+    _SEND_IN_PROGRESS = True
     try:
         result = await _send(
             phone=body["phone"],
             message=body.get("message", ""),
             file_items=body.get("files", []),
         )
+        _WA_READY = True
         return result
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
+    finally:
+        _SEND_IN_PROGRESS = False
