@@ -29,6 +29,13 @@ _BIDI_CHARS = {0x200F, 0x200E, 0x202B, 0x202A, 0x202C, 0x202D, 0x202E}
 _WA_READY = False  # True while WhatsApp Web is loaded AND authenticated
 _SEND_IN_PROGRESS = False  # monitor must not navigate while a send is running
 
+_STEALTH_JS = """
+    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+    Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
+    window.chrome = {runtime: {}};
+"""
+WHATSAPP_URL = "https://web.whatsapp.com"
+
 
 @app.on_event("startup")
 async def _startup():
@@ -94,13 +101,7 @@ async def _monitor_whatsapp():
             continue
         try:
             _, page = await _get_fresh_page()
-            if "web.whatsapp.com" not in (page.url or ""):
-                await page.add_init_script("""
-                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                    Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
-                    window.chrome = {runtime: {}};
-                """)
-                await page.goto("https://web.whatsapp.com", wait_until="domcontentloaded", timeout=60000)
+            if await _ensure_on_whatsapp(page):
                 await page.wait_for_timeout(8000)
             was_ready = _WA_READY
             _WA_READY = await _check_wa_authenticated(page)
@@ -134,6 +135,12 @@ def _file_post_send_wait_ms(size_bytes: int) -> int:
 
 async def _launch_context():
     global _PLAYWRIGHT, _CONTEXT
+    if _CONTEXT is not None:
+        try:
+            await _CONTEXT.close()
+        except Exception:
+            pass
+        _CONTEXT = None
     if _PLAYWRIGHT:
         try:
             await _PLAYWRIGHT.stop()
@@ -157,6 +164,28 @@ async def _launch_context():
             "--disable-blink-features=AutomationControlled",
         ],
     )
+
+
+async def _ensure_on_whatsapp(page, force: bool = False) -> bool:
+    """מנווט ל-WhatsApp Web רק אם הדף לא כבר שם. מחזיר True אם באמת נטען מחדש."""
+    if not force:
+        try:
+            if (page.url or "").startswith(WHATSAPP_URL):
+                return False
+        except Exception:
+            pass
+    await page.goto(WHATSAPP_URL, wait_until="domcontentloaded", timeout=60000)
+    return True
+
+
+async def _close_page_quietly(page) -> None:
+    if page is None:
+        return
+    try:
+        if not page.is_closed():
+            await page.close()
+    except Exception:
+        pass
 
 
 async def _get_fresh_page():
@@ -183,6 +212,9 @@ async def _get_fresh_page():
                     # Quick check: try to evaluate JS
                     await _PAGE.evaluate("1+1")
             except Exception:
+                # קודם רק ניתקנו את ההפניה, והטאב התקוע נשאר פתוח בדפדפן עם כל
+                # מה שהחזיק. כל טאב כזה הוא מאות MB שלא חוזרים.
+                await _close_page_quietly(_PAGE)
                 _PAGE = None
 
         if _PAGE is None:
@@ -193,6 +225,14 @@ async def _get_fresh_page():
                 _PAGE = None
                 await _launch_context()
                 _PAGE = await _CONTEXT.new_page()
+            await _PAGE.add_init_script(_STEALTH_JS)
+
+        # רשת ביטחון: הדפדפן אמור להחזיק טאב אחד. כל טאב עודף הוא דליפה.
+        try:
+            for stray in [pg for pg in _CONTEXT.pages if pg is not _PAGE]:
+                await _close_page_quietly(stray)
+        except Exception:
+            pass
 
         return _CONTEXT, _PAGE
 
@@ -367,15 +407,12 @@ async def health():
 async def _get_whatsapp_screenshot() -> bytes:
     import base64 as _b64
     _, page = await _get_fresh_page()
-    # Hide automation fingerprints before loading
-    await page.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-        Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
-        window.chrome = {runtime: {}};
-    """)
-    await page.goto("https://web.whatsapp.com", wait_until="domcontentloaded", timeout=60000)
+    # דף ה-QR מושך את הצילום כל 20 שניות. פעם היה כאן add_init_script + goto בכל
+    # קריאה: הסקריפטים נערמו על הדף לנצח וה-SPA הכבד נטען מחדש שוב ושוב, וזה מה
+    # שהעיף את הזיכרון מ-1 GB ל-7.7 GB. עכשיו טוענים רק אם באמת עזבנו את הדף.
+    reloaded = await _ensure_on_whatsapp(page)
     # Wait for QR canvas or chat
-    for _ in range(20):
+    for _ in range(20 if reloaded else 2):
         await page.wait_for_timeout(1500)
         qr_canvas = page.locator("canvas")
         chat_ready = page.locator("div[aria-label='Chat list'], div[data-icon='chat']")
