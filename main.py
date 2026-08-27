@@ -86,6 +86,22 @@ async def _check_wa_authenticated(page) -> bool:
     return authenticated > 0 and qr == 0
 
 
+async def _whatsapp_state(page) -> str:
+    """מה מוצג כרגע: authenticated / qr / loading.
+
+    ה-QR מזוהה דרך _QR_SELECTOR בלבד ולא דרך canvas גנרי — תצוגות PDF בצ'אטים
+    נרנדרות כ-canvas, וזה בדיוק ה-false negative שתוקן ב-08.07.
+    """
+    try:
+        if await page.locator(_AUTHENTICATED_SELECTOR).count():
+            return "authenticated"
+        if await page.locator(_QR_SELECTOR).count():
+            return "qr"
+    except Exception:
+        pass
+    return "loading"
+
+
 async def _monitor_whatsapp():
     """Keep _WA_READY accurate for the whole process lifetime.
 
@@ -404,6 +420,68 @@ async def health():
     return {"ok": True, "wa_ready": _WA_READY}
 
 
+async def _reset_profile() -> dict:
+    """סוגר את הדפדפן, מוחק את פרופיל ההתחברות השמור ומשחרר אותו למוניטור.
+
+    בלי זה אין מסלול חזרה ממצב שבו הסשן התנתק אבל הפרופיל בדיסק עדיין
+    "חצי מחובר": WhatsApp Web לא מציג QR חדש, השליחה נכשלת, ואין מה לעשות.
+    """
+    import logging, shutil
+    global _PLAYWRIGHT, _CONTEXT, _PAGE, _WA_READY
+    async with _CONTEXT_LOCK:
+        await _close_page_quietly(_PAGE)
+        for closer in (
+            lambda: _CONTEXT.close() if _CONTEXT else None,
+            lambda: _PLAYWRIGHT.stop() if _PLAYWRIGHT else None,
+        ):
+            try:
+                result = closer()
+                if result is not None:
+                    await result
+            except Exception as exc:
+                logging.warning("reset: close step failed: %s", exc)
+        _PAGE = _CONTEXT = _PLAYWRIGHT = None
+        _WA_READY = False
+
+        removed = 0
+        for child in list(PROFILE_DIR.iterdir()) if PROFILE_DIR.exists() else []:
+            try:
+                shutil.rmtree(child) if child.is_dir() else child.unlink()
+                removed += 1
+            except Exception as exc:
+                logging.warning("reset: could not remove %s: %s", child, exc)
+        PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        logging.warning("reset: cleared %s entries from the saved profile", removed)
+    return {"status": "ok", "cleared_entries": removed}
+
+
+@app.get("/status")
+async def status_endpoint():
+    """מצב הגשר לאבחון מהיר מבחוץ, בלי לפתוח את דף ה-QR."""
+    state = "unknown"
+    try:
+        if _PAGE and not _PAGE.is_closed():
+            state = await _whatsapp_state(_PAGE)
+    except Exception:
+        pass
+    return {"ok": True, "wa_ready": _WA_READY, "state": state,
+            "authenticated": state == "authenticated"}
+
+
+@app.get("/session/reset")
+@app.post("/session/reset")
+async def session_reset(secret: str = ""):
+    """מוחק את פרופיל ההתחברות ומכריח QR חדש. פתיחה בדפדפן מספיקה.
+
+    אין צורך להעיר כאן שום דבר: _monitor_whatsapp רץ לאורך כל חיי התהליך
+    ויקים הקשר חדש בסבב הבא שלו.
+    """
+    if SECRET_TOKEN and secret != SECRET_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    result = await _reset_profile()
+    return {**result, "next": "פתח /qr/page וסרוק את הקוד החדש"}
+
+
 async def _get_whatsapp_screenshot() -> bytes:
     import base64 as _b64
     _, page = await _get_fresh_page()
@@ -484,7 +562,14 @@ async def qr_image():
     from fastapi.responses import Response
     try:
         screenshot = await _get_whatsapp_screenshot()
-        return Response(content=screenshot, media_type="image/png")
+        state = "loading"
+        try:
+            if _PAGE and not _PAGE.is_closed():
+                state = await _whatsapp_state(_PAGE)
+        except Exception:
+            pass
+        return Response(content=screenshot, media_type="image/png",
+                        headers={"X-WA-State": state, "Cache-Control": "no-store"})
     except Exception as exc:
         import traceback
         return JSONResponse({"error": str(exc), "trace": traceback.format_exc()}, status_code=500)
