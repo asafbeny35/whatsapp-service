@@ -274,7 +274,35 @@ async def _wait_for_delivery(page, timeout_ms: int = 45000) -> None:
         waited += 3000
 
 
+async def _recycle_page() -> None:
+    """Close only the page, keep the authenticated context/profile.
+
+    After a completed send the kept-alive page sometimes wedges: the attach
+    click no longer fires a filechooser, and the 1+1 liveness check still
+    passes so the broken page is recycled forever (the 15-18.08 incident in
+    miniature). A fresh page in the same context needs no QR re-scan.
+    """
+    global _PAGE
+    if _PAGE and not _PAGE.is_closed():
+        try:
+            await _PAGE.close()
+        except Exception:
+            pass
+    _PAGE = None
+
+
 async def _send(phone: str, message: str, file_items: list[dict]) -> dict:
+    """Send with one retry on a fresh page — a wedged page fails on attach."""
+    try:
+        return await _send_once(phone, message, file_items)
+    except Exception as exc:
+        if "Could not attach" not in str(exc):
+            raise
+        await _recycle_page()
+        return await _send_once(phone, message, file_items)
+
+
+async def _send_once(phone: str, message: str, file_items: list[dict]) -> dict:
     """file_items: list of {name, content_b64, size_bytes}"""
     phone = _normalize_phone(phone)
     _, page = await _get_fresh_page()
@@ -355,6 +383,9 @@ async def _send(phone: str, message: str, file_items: list[dict]) -> dict:
                 "[data-testid='send']"
             ).last
 
+            # A leftover attach menu from a previous send swallows the next click
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(400)
             # Open attach menu and click Document to get a file chooser
             await attach_button.first.wait_for(timeout=30000)
             try:
@@ -574,6 +605,15 @@ async def qr_image():
         import traceback
         return JSONResponse({"error": str(exc), "trace": traceback.format_exc()}, status_code=500)
 
+
+
+@app.post("/page/reset")
+async def page_reset_endpoint(body: dict | None = None):
+    """Soft reset: new page, same authenticated profile — no QR re-scan."""
+    if SECRET_TOKEN and (body or {}).get("secret") != SECRET_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    await _recycle_page()
+    return {"status": "ok", "page": "recycled"}
 
 
 @app.post("/send")
