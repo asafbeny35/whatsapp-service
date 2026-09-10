@@ -327,17 +327,16 @@ async def _send_once(phone: str, message: str, file_items: list[dict]) -> dict:
             "Visit /qr/page to scan the QR code, then retry."
         )
 
-    # ה-UI המעוגל החדש (ספטמבר 2026) החליף את קליפס הצירוף בכפתור פלוס עם
-    # aria-label אחר — דף טרי טוען את הבאנדל החדש ו'Attach' לבדו כבר לא נתפס.
-    attach_button = page.locator(
-        "button[aria-label='Attach'], button[aria-label='צרף'], "
-        "button[title='Attach'], button[title='צרף'], "
-        "div[role='button'][aria-label='Attach'], div[role='button'][aria-label='צרף'], "
-        "footer button:has(span[data-icon='plus']), "
-        "footer button:has(span[data-icon='plus-rounded']), "
-        "footer button:has(span[data-icon='clip']), "
-        "footer button:has(span[data-icon='attach-menu-plus']), "
-        "[data-testid='conversation-clip']"
+    # יש עותק נסתר של כפתור Attach שקודם ב-DOM לכפתור האמיתי שבשורת הכתיבה,
+    # ו-.first על סלקטור עמוד-שלם נתפס עליו ומחכה לנצח לנראוּת. לכן: רק בתוך
+    # ה-footer ורק אלמנטים נראים (:visible של Playwright, לא CSS תקני).
+    attach_button = page.locator("footer").locator(
+        "button[aria-label='Attach']:visible, button[aria-label='צרף']:visible, "
+        "button[title='Attach']:visible, button[title='צרף']:visible, "
+        "button:has(span[data-icon='plus']):visible, "
+        "button:has(span[data-icon='plus-rounded']):visible, "
+        "button:has(span[data-icon='clip']):visible, "
+        "button:has(span[data-icon='attach-menu-plus']):visible"
     )
     message_box = page.locator(
         "footer div[contenteditable='true'], "

@@ -5,6 +5,10 @@ dockerfilePath = "Dockerfile"
 healthcheckPath = "/health"
 healthcheckTimeout = 300
 restartPolicyType = "ON_FAILURE"
+# בלי חפיפה: אינסטנס ישן וחדש במקביל = שני Chromium על אותו פרופיל בדיוק,
+# הנעילה נשברת והסשן נהרס — ומכאן סריקת ה-QR אחרי כל פריסה.
+overlapSeconds = 0
+drainingSeconds = 15
 
 [[volumes]]
 mountPath = "/app/whatsapp-profile"
