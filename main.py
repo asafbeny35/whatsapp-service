@@ -327,16 +327,16 @@ async def _send_once(phone: str, message: str, file_items: list[dict]) -> dict:
             "Visit /qr/page to scan the QR code, then retry."
         )
 
-    # יש עותק נסתר של כפתור Attach שקודם ב-DOM לכפתור האמיתי שבשורת הכתיבה,
-    # ו-.first על סלקטור עמוד-שלם נתפס עליו ומחכה לנצח לנראוּת. לכן: רק בתוך
-    # ה-footer ורק אלמנטים נראים (:visible של Playwright, לא CSS תקני).
+    # בתוך ה-footer בלבד: עותק נסתר של הכפתור מחוץ לשורת הכתיבה תפס את .first
+    # על סלקטור עמוד-שלם. בלי :visible — ב-UI המעוגל הכפתור מדווח קופסה ריקה
+    # עד אינטראקציה, וההמתנה היא לקיום בלבד (הקליק מטופל בשרשרת נפילות).
     attach_button = page.locator("footer").locator(
-        "button[aria-label='Attach']:visible, button[aria-label='צרף']:visible, "
-        "button[title='Attach']:visible, button[title='צרף']:visible, "
-        "button:has(span[data-icon='plus']):visible, "
-        "button:has(span[data-icon='plus-rounded']):visible, "
-        "button:has(span[data-icon='clip']):visible, "
-        "button:has(span[data-icon='attach-menu-plus']):visible"
+        "button[aria-label='Attach'], button[aria-label='צרף'], "
+        "button[title='Attach'], button[title='צרף'], "
+        "button:has(span[data-icon='plus']), "
+        "button:has(span[data-icon='plus-rounded']), "
+        "button:has(span[data-icon='clip']), "
+        "button:has(span[data-icon='attach-menu-plus'])"
     )
     message_box = page.locator(
         "footer div[contenteditable='true'], "
@@ -397,11 +397,39 @@ async def _send_once(phone: str, message: str, file_items: list[dict]) -> dict:
             # A leftover attach menu from a previous send swallows the next click
             await page.keyboard.press("Escape")
             await page.wait_for_timeout(400)
-            # Open attach menu and click Document to get a file chooser
-            await attach_button.first.wait_for(timeout=30000)
+            # ה-UI המעוגל מרנדר את כפתור הצירוף עם קופסה ריקה עד אינטראקציה,
+            # ו-Playwright מסווג אותו "לא נראה" לנצח. לכן: ממתינים לקיום בלבד,
+            # נותנים פוקוס לשורת הכתיבה (מגלה את הכפתור), ואם קליק רגיל נופל —
+            # קליק force ואז click() ישיר ב-JS שעוקף את בדיקות הנראוּת לגמרי.
+            await attach_button.first.wait_for(state="attached", timeout=30000)
+            try:
+                await message_box.click(timeout=3000)
+                await page.wait_for_timeout(400)
+            except Exception:
+                pass
+
+            async def _click_attach():
+                try:
+                    await attach_button.first.click(timeout=4000)
+                    return
+                except Exception:
+                    pass
+                try:
+                    await attach_button.first.click(timeout=4000, force=True)
+                    return
+                except Exception:
+                    pass
+                await page.evaluate(
+                    "() => { const b = [...document.querySelectorAll('footer button')]"
+                    ".find(x => (x.getAttribute('aria-label') || '') === 'Attach'"
+                    " || (x.getAttribute('aria-label') || '') === 'צרף'"
+                    " || x.querySelector(\"span[data-icon^='plus'], span[data-icon='clip']\"));"
+                    " if (b) b.click(); }"
+                )
+
             try:
                 async with page.expect_file_chooser(timeout=20000) as fc_info:
-                    await attach_button.first.click()
+                    await _click_attach()
                     await page.wait_for_timeout(1000)
                     # Click Document option — selector confirmed from live WhatsApp Web DOM
                     for selector in [
@@ -419,7 +447,11 @@ async def _send_once(phone: str, message: str, file_items: list[dict]) -> dict:
                         loc = page.locator(selector)
                         try:
                             if await loc.count() > 0:
-                                await loc.first.click(timeout=5000)
+                                try:
+                                    await loc.first.click(timeout=5000)
+                                except Exception:
+                                    # אותה מחלת נראוּת של ה-UI המעוגל גם בתפריט
+                                    await loc.first.click(timeout=3000, force=True)
                                 break
                         except Exception:
                             continue
