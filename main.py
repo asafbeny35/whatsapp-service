@@ -296,7 +296,8 @@ async def _send(phone: str, message: str, file_items: list[dict]) -> dict:
     try:
         return await _send_once(phone, message, file_items)
     except Exception as exc:
-        if "Could not attach" not in str(exc):
+        # ניסיון חוזר על דף טרי לכל תקלת UI; לא על בעיות אימות — שם דף חדש לא יעזור
+        if "not authenticated" in str(exc).lower():
             raise
         await _recycle_page()
         return await _send_once(phone, message, file_items)
@@ -326,7 +327,18 @@ async def _send_once(phone: str, message: str, file_items: list[dict]) -> dict:
             "Visit /qr/page to scan the QR code, then retry."
         )
 
-    attach_button = page.locator("button[aria-label='Attach']")
+    # ה-UI המעוגל החדש (ספטמבר 2026) החליף את קליפס הצירוף בכפתור פלוס עם
+    # aria-label אחר — דף טרי טוען את הבאנדל החדש ו'Attach' לבדו כבר לא נתפס.
+    attach_button = page.locator(
+        "button[aria-label='Attach'], button[aria-label='צרף'], "
+        "button[title='Attach'], button[title='צרף'], "
+        "div[role='button'][aria-label='Attach'], div[role='button'][aria-label='צרף'], "
+        "footer button:has(span[data-icon='plus']), "
+        "footer button:has(span[data-icon='plus-rounded']), "
+        "footer button:has(span[data-icon='clip']), "
+        "footer button:has(span[data-icon='attach-menu-plus']), "
+        "[data-testid='conversation-clip']"
+    )
     message_box = page.locator(
         "footer div[contenteditable='true'], "
         "div[contenteditable='true'][data-tab='10'], "
@@ -400,6 +412,10 @@ async def _send_once(phone: str, message: str, file_items: list[dict]) -> dict:
                         "[role='menuitem'][aria-label='מסמך']",
                         "li[data-testid='mi-attach-document']",
                         "li[data-testid='attach-document']",
+                        # ה-UI החדש: הפריט מזוהה לפי אייקון המסמך, לא לפי label
+                        "[role='menuitem']:has(span[data-icon='document'])",
+                        "[role='menuitem']:has(span[data-icon='document-filled-refreshed'])",
+                        "li:has(span[data-icon='document'])",
                     ]:
                         loc = page.locator(selector)
                         try:
@@ -605,6 +621,30 @@ async def qr_image():
         import traceback
         return JSONResponse({"error": str(exc), "trace": traceback.format_exc()}, status_code=500)
 
+
+
+@app.post("/debug/composer")
+async def debug_composer_endpoint(body: dict | None = None):
+    """אבחון מרחוק של סלקטורים: פותח צ'אט ומחזיר את כפתורי ה-footer וה-HTML שלו.
+
+    בלי זה כל ניחוש סלקטור עולה מחזור פריסה של ~8 דקות + סיכון סריקת QR.
+    """
+    if SECRET_TOKEN and (body or {}).get("secret") != SECRET_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    phone = _normalize_phone((body or {}).get("phone") or "")
+    _, page = await _get_fresh_page()
+    if phone:
+        await page.goto(f"https://web.whatsapp.com/send?phone={phone}", wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(8000)
+    buttons = await page.evaluate("""
+        () => Array.from(document.querySelectorAll('footer button, footer div[role="button"], footer span[data-icon]'))
+            .map(el => ({tag: el.tagName, aria: el.getAttribute('aria-label'),
+                         title: el.getAttribute('title'), icon: el.getAttribute('data-icon')}))
+    """)
+    footer_html = await page.evaluate(
+        "() => { const f = document.querySelector('footer'); return f ? f.outerHTML.slice(0, 4000) : 'no footer'; }"
+    )
+    return {"buttons": buttons, "footer_html": footer_html}
 
 
 @app.post("/page/reset")
