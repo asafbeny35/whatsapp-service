@@ -395,8 +395,8 @@ async def _send_once(phone: str, message: str, file_items: list[dict]) -> dict:
             ).last
 
             # A leftover attach menu from a previous send swallows the next click
-            await page.keyboard.press("Escape")
-            await page.wait_for_timeout(400)
+            # אסור Escape כאן — ב-WhatsApp Web הוא סוגר את הצ'אט הפתוח כולו,
+            # וה-footer נעלם יחד עם כפתור הצירוף (הבאג של 10.09).
             # ה-UI המעוגל מרנדר את כפתור הצירוף עם קופסה ריקה עד אינטראקציה,
             # ו-Playwright מסווג אותו "לא נראה" לנצח. לכן: ממתינים לקיום בלבד,
             # נותנים פוקוס לשורת הכתיבה (מגלה את הכפתור), ואם קליק רגיל נופל —
