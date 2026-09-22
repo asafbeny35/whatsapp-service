@@ -300,7 +300,10 @@ async def _send(phone: str, message: str, file_items: list[dict]) -> dict:
         if "not authenticated" in str(exc).lower():
             raise
         await _recycle_page()
-        return await _send_once(phone, message, file_items)
+        # אם הטקסט כבר נשלח בניסיון הראשון, הניסיון החוזר שולח רק את הקבצים —
+        # אחרת הלקוח מקבל את אותה הודעה פעמיים
+        retry_message = "" if getattr(exc, "text_already_sent", False) else message
+        return await _send_once(phone, retry_message, file_items)
 
 
 async def _send_once(phone: str, message: str, file_items: list[dict]) -> dict:
@@ -377,6 +380,12 @@ async def _send_once(phone: str, message: str, file_items: list[dict]) -> dict:
             except Exception:
                 await page.keyboard.press("Enter")
         await page.wait_for_timeout(1200)
+
+    def _file_stage_error(text: str) -> RuntimeError:
+        """שגיאה בשלב הקבצים — הטקסט כבר יצא, והניסיון החוזר לא ישלח אותו שוב."""
+        err = RuntimeError(text)
+        err.text_already_sent = bool(message)
+        return err
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -459,10 +468,16 @@ async def _send_once(phone: str, message: str, file_items: list[dict]) -> dict:
                 await fc.set_files(str(file_path))
                 await page.wait_for_timeout(5000)
             except Exception as exc:
-                raise RuntimeError(
+                raise _file_stage_error(
                     f"Could not attach {item['name']}: {exc}. "
                     "Check /qr/page to confirm session is active."
                 )
+
+            # בסיס לאימות: כמה בועות הודעה יוצאות יש בצ'אט לפני שיגור הצרופה.
+            # ההודעה המקדימה שנשלחה הרגע נספרת כאן — לכן בזרימות עם טקסט
+            # out_before תמיד גדול מאפס והאימות למטה פעיל.
+            out_bubbles = page.locator("div.message-out")
+            out_before = await out_bubbles.count()
 
             # Wait for attachment send button — try clicking, fall back to Enter
             try:
@@ -471,20 +486,54 @@ async def _send_once(phone: str, message: str, file_items: list[dict]) -> dict:
                 pass  # fall through to Enter fallback
             await page.wait_for_timeout(max(2000, _file_send_wait_ms(size_bytes) - 3000))
 
-            clicked = False
-            for attempt_cfg in [{"force": False}, {"force": True}]:
+            async def _click_send_or_enter():
+                for attempt_cfg in [{"force": False}, {"force": True}]:
+                    try:
+                        await attachment_send_button.click(timeout=4000, **attempt_cfg)
+                        await page.wait_for_timeout(900)
+                        return True
+                    except Exception:
+                        pass
+                await page.keyboard.press("Enter")
+                return False
+
+            await _click_send_or_enter()
+            await page.wait_for_timeout(_file_post_send_wait_ms(size_bytes))
+
+            # אימות שהצרופה באמת שוגרה — קליק "שלח" שנכשל השאיר את התצוגה
+            # המקדימה פתוחה-לא-שלוחה, וה-200 השקרי גרם לקובץ שנעלם בשקט
+            # (חשבונית 550638, 22.09). בדיקת ה-pending לא תופסת את זה: צרופה
+            # שמעולם לא שוגרה אינה הודעה ממתינה.
+            async def _attachment_left() -> bool:
                 try:
-                    await attachment_send_button.click(timeout=4000, **attempt_cfg)
-                    await page.wait_for_timeout(900)
-                    clicked = True
-                    break
+                    if await out_bubbles.count() > out_before:
+                        return True
                 except Exception:
                     pass
+                return False
 
-            if not clicked:
-                await page.keyboard.press("Enter")
+            async def _preview_still_open() -> bool:
+                try:
+                    return await attachment_send_button.is_visible()
+                except Exception:
+                    return False
 
-            await page.wait_for_timeout(_file_post_send_wait_ms(size_bytes))
+            sent = await _attachment_left()
+            if not sent:
+                # סבב הצלה אחד: אולי הקליק פספס בזמן שהתצוגה עוד נטענה
+                await _click_send_or_enter()
+                for _ in range(15):
+                    if await _attachment_left():
+                        sent = True
+                        break
+                    await page.wait_for_timeout(1000)
+            if not sent and (out_before > 0 or await _preview_still_open()):
+                # out_before==0 בלי תצוגה פתוחה = הסלקטור של הבועות מת (שינוי DOM
+                # של וואטסאפ) ואין ראיה לכישלון — עדיף לא להפיל שליחות תקינות.
+                raise _file_stage_error(
+                    f"Attachment {item['name']} never appeared as an outgoing message — "
+                    "the send click failed silently (preview left unsent)."
+                )
 
     await page.wait_for_timeout(5000)
     # Verify the messages actually left the device — a zombie session keeps them pending forever
